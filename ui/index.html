@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Octopus Receive</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 system-ui, sans-serif; padding: 16px; color: #1c2430; background: #f6f8fa; }
+  @media (prefers-color-scheme: dark) { body { color: #e6edf3; background: #0d1117; } .card { background: #161b22; border-color: #30363d; } input, button { background: #21262d; color: #e6edf3; border-color: #30363d; } }
+  h1 { font-size: 16px; margin: 0 0 4px; }
+  p.hint { margin: 0 0 12px; opacity: .75; font-size: 12px; }
+  .card { background: #fff; border: 1px solid #d0d7de; border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+  input[type=file] { width: 100%; margin: 6px 0; }
+  button { font: inherit; padding: 7px 14px; border-radius: 8px; border: 1px solid #d0d7de; cursor: pointer; }
+  button.primary { background: #2f6f4f; color: #fff; border-color: #2f6f4f; }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .counts { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; margin: 10px 0; }
+  .count { border: 1px solid #d0d7de; border-radius: 8px; padding: 8px; text-align: center; }
+  .count b { display: block; font-size: 18px; }
+  .count span { font-size: 11px; opacity: .7; }
+  progress { width: 100%; height: 10px; }
+  pre.log { max-height: 260px; overflow: auto; font-size: 12px; background: rgba(127,127,127,.08); border-radius: 8px; padding: 10px; white-space: pre-wrap; word-break: break-all; }
+  .ok { color: #2f9e63; } .err { color: #d1453b; }
+  label.check { display: flex; gap: 6px; align-items: center; font-size: 13px; margin: 4px 0; }
+</style>
+</head>
+<body>
+  <h1>Octopus Receive</h1>
+  <p class="hint">Import an Octopus backup JSON into this Sepia gateway. Channels become providers, groups become routes, pricing and API keys are imported too. Requires an administrator session.</p>
+
+  <div class="card">
+    <input type="file" id="file" accept=".json,application/json" />
+    <div class="row">
+      <button id="analyze" disabled>Analyze</button>
+      <span id="fileinfo" class="hint"></span>
+    </div>
+  </div>
+
+  <div class="card" id="preview" hidden>
+    <div class="counts" id="counts"></div>
+    <label class="check"><input type="checkbox" id="importKeys" checked /> Import API keys (client keys)</label>
+    <label class="check"><input type="checkbox" id="importPrices" checked /> Import model pricing</label>
+    <div class="row">
+      <button id="run" class="primary" disabled>Import</button>
+      <button id="reset" disabled>Reset</button>
+    </div>
+  </div>
+
+  <div class="card" id="progressCard" hidden>
+    <div class="row"><span id="phaseLabel"></span><span id="progressText"></span></div>
+    <progress id="progress" max="1" value="0"></progress>
+    <pre class="log" id="log"></pre>
+  </div>
+
+<script src="mapping.js"></script>
+<script>
+(function () {
+  var M = window.OctopusMapping
+  var fileInput = document.getElementById('file')
+  var analyzeBtn = document.getElementById('analyze')
+  var runBtn = document.getElementById('run')
+  var resetBtn = document.getElementById('reset')
+  var preview = document.getElementById('preview')
+  var progressCard = document.getElementById('progressCard')
+  var logEl = document.getElementById('log')
+  var backup = null
+  var plan = null
+  var existing = { providers: [], routes: [], groups: [], keys: [] }
+  var running = false
+
+  function logLine(text, cls) {
+    var line = document.createElement('div')
+    if (cls) line.className = cls
+    line.textContent = text
+    logEl.appendChild(line)
+    logEl.scrollTop = logEl.scrollHeight
+  }
+
+  function rpc(path, body) {
+    return window.sepia.call(path, body).then(function (result) {
+      var status = result && result.status
+      var parsed = null
+      try { parsed = result && result.body ? JSON.parse(result.body) : null } catch (e) { parsed = null }
+      if (status >= 200 && status < 300) return parsed
+      var err = parsed && parsed.error
+      var message = (err && (err.message || err)) || (parsed && parsed.message) || (result && result.body) || ('HTTP ' + status)
+      throw new Error(typeof message === 'string' ? message : JSON.stringify(message))
+    })
+  }
+
+  function adminGet(path) {
+    return rpc('proxy', { path: path, method: 'GET' })
+  }
+
+  fileInput.addEventListener('change', function () {
+    analyzeBtn.disabled = !fileInput.files.length
+    preview.hidden = true
+    document.getElementById('fileinfo').textContent = fileInput.files.length ? fileInput.files[0].name : ''
+  })
+
+  analyzeBtn.addEventListener('click', function () {
+    var file = fileInput.files[0]
+    if (!file) return
+    analyzeBtn.disabled = true
+    logEl.textContent = ''
+    progressCard.hidden = false
+    logLine('Reading backup…')
+    file.text().then(function (text) {
+      backup = JSON.parse(text)
+      if (!backup || !Array.isArray(backup.channels)) throw new Error('Not an Octopus backup (missing channels)')
+      logLine('Loading current gateway state…')
+      return Promise.all([adminGet('/api/v1/providers'), adminGet('/api/v1/routes'), adminGet('/api/v1/groups'), adminGet('/api/v1/keys')])
+    }).then(function (results) {
+      existing.providers = results[0] || []
+      existing.routes = results[1] || []
+      existing.groups = results[2] || []
+      existing.keys = results[3] || []
+      plan = M.buildPlan(backup, existing)
+      renderPreview()
+      logLine('Analysis complete.', 'ok')
+    }).catch(function (error) {
+      logLine('Analyze failed: ' + error.message, 'err')
+    }).finally(function () {
+      analyzeBtn.disabled = !fileInput.files.length
+    })
+  })
+
+  function renderPreview() {
+    var labels = { providers: 'Providers', routes: 'Routes', prices: 'Prices', keys: 'API keys' }
+    var countsEl = document.getElementById('counts')
+    countsEl.textContent = ''
+    // Provider/key counts are known up front; routes/prices resolve after the
+    // provider phase, so show a dash until then.
+    var known = { providers: plan.phases[0].requests.length, keys: plan.phases[3].requests.length }
+    Object.keys(labels).forEach(function (id) {
+      var cell = document.createElement('div')
+      cell.className = 'count'
+      var b = document.createElement('b'); b.textContent = known[id] != null ? known[id] : '—'
+      var s = document.createElement('span'); s.textContent = labels[id]
+      cell.appendChild(b); cell.appendChild(s); countsEl.appendChild(cell)
+    })
+    preview.hidden = false
+    runBtn.disabled = false
+    resetBtn.disabled = false
+    ;(plan.skipped || []).forEach(function (item) {
+      logLine('skip ' + item.kind + ' ' + item.name + ': ' + item.reason, 'err')
+    })
+  }
+
+  resetBtn.addEventListener('click', function () {
+    if (running) return
+    backup = null; plan = null
+    fileInput.value = ''
+    preview.hidden = true
+    progressCard.hidden = true
+    analyzeBtn.disabled = true
+    document.getElementById('fileinfo').textContent = ''
+  })
+
+  runBtn.addEventListener('click', function () {
+    if (!plan || running) return
+    running = true
+    runBtn.disabled = true; resetBtn.disabled = true; analyzeBtn.disabled = true
+    logEl.textContent = ''
+    var importPrices = document.getElementById('importPrices').checked
+    var importKeys = document.getElementById('importKeys').checked
+    var done = 0, failed = 0, total = 0
+    var progress = document.getElementById('progress')
+    var providerIds = new Map()
+
+    function refreshProviders() {
+      return adminGet('/api/v1/providers').then(function (providers) {
+        var byName = new Map((providers || []).map(function (p) { return [p.name, p.id] }))
+        providerIds = new Map()
+        plan.providerMap.forEach(function (name, channelId) {
+          var id = byName.get(name)
+          if (id != null) providerIds.set(channelId, id)
+        })
+      })
+    }
+
+    function send(request) {
+      return rpc('proxy', { path: request.path, method: request.method, body: request.body })
+    }
+
+    function runRequests(requests, phaseId, afterOne) {
+      var chain = Promise.resolve()
+      requests.forEach(function (request) {
+        chain = chain.then(function () {
+          return send(request).then(function (result) {
+            done++; progress.value = done
+            document.getElementById('progressText').textContent = done + ' / ' + total
+            if (afterOne) return afterOne(request, result)
+          }).catch(function (error) {
+            done++; failed++; progress.value = done
+            logLine((request.kind || phaseId) + ' ' + (request.name || request.slug || (request.body && request.body.model) || '') + ': ' + error.message, 'err')
+          })
+        })
+      })
+      return chain
+    }
+
+    function setPhase(label) { document.getElementById('phaseLabel').textContent = 'Phase: ' + label }
+
+    refreshProviders().then(function () {
+      // Run the provider phase first (groups + providers), then resolve route,
+      // price and key-policy phases against the live provider ids.
+      total = plan.phases[0].requests.length
+      progress.max = total || 1
+      setPhase('providers')
+      return runRequests(plan.phases[0].requests, 'providers').then(refreshProviders)
+    }).then(function () {
+      var resolved = M.resolvePhases(plan, backup, providerIds, existing.routes)
+      ;(resolved.routes.skipped || []).forEach(function (item) { logLine('skip route ' + item.name + ': ' + item.reason, 'err') })
+      var phases = [
+        { id: 'routes', requests: resolved.routes.requests },
+        { id: 'prices', requests: importPrices ? resolved.prices : [] },
+        { id: 'keys', requests: importKeys ? plan.phases[3].requests : [] },
+      ]
+      total += phases.reduce(function (sum, phase) { return sum + phase.requests.length }, 0)
+      progress.max = total || 1
+      var chain = Promise.resolve()
+      phases.forEach(function (phase) {
+        chain = chain.then(function () {
+          setPhase(phase.id)
+          if (phase.id === 'keys') {
+            return runRequests(phase.requests, phase.id, function (request, result) {
+              var follow = []
+              if (request.enabled === false && result && result.id != null) {
+                follow.push(rpc('proxy', { path: '/api/v1/keys/' + result.id + '/enabled', method: 'POST', body: { enabled: false } }))
+              }
+              var policy = resolved.policies.get(request.name)
+              if (policy && result && result.id != null) {
+                follow.push(rpc('proxy', { path: '/api/v1/keys/' + result.id + '/policy', method: 'POST', body: policy }))
+              }
+              return Promise.all(follow).catch(function (error) {
+                failed++
+                logLine('key ' + request.name + ' follow-up: ' + error.message, 'err')
+              })
+            })
+          }
+          return runRequests(phase.requests, phase.id)
+        })
+      })
+      return chain
+    }).then(function () {
+      logLine('Import finished: ' + (done - failed) + ' succeeded, ' + failed + ' failed.', failed ? 'err' : 'ok')
+      document.getElementById('phaseLabel').textContent = 'Done'
+    }).catch(function (error) {
+      logLine('Import aborted: ' + error.message, 'err')
+    }).finally(function () {
+      running = false
+      runBtn.disabled = false; resetBtn.disabled = false; analyzeBtn.disabled = !fileInput.files.length
+    })
+  })
+})()
+</script>
+</body>
+</html>

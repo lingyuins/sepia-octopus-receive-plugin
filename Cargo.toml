@@ -1,0 +1,16 @@
+[package]
+name = "sepia-octopus-receive"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sepia-plugin-sdk = { path = "../backend/plugin-sdk" }
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+strip = true

@@ -1,0 +1,16 @@
+{
+  "host_api": 1,
+  "id": "octopus-receive",
+  "name": "Octopus Receive",
+  "version": "0.1.0",
+  "description": "Import an Octopus backup (channels, groups, routes, pricing, API keys) into Sepia through the management API.",
+  "entry": "handle",
+  "events": ["http.rpc", "plugin.migrate"],
+  "permissions": ["admin", "log"],
+  "http_origins": [],
+  "priority": 100,
+  "timeout_ms": 2000,
+  "memory_mib": 64,
+  "config_schema": {},
+  "ui": { "entry": "index.html", "title": "Octopus Receive" }
+}
