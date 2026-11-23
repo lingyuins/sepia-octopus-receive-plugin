@@ -20,7 +20,7 @@ A Sepia plugin that imports an [Octopus](https://github.com/bestruirui/octopus) 
 - **`match_regex`** is converted to Sepia glob patterns only for simple literal alternations / a trailing `.*`. Real regex metacharacters cannot be represented; the route keeps its slug pattern and the loss is logged.
 - **`allowed_group_categories`** restricts which Octopus *groups* (routes) a key can see. Sepia's `allowed_groups` filters *provider groups* instead, so the two are not equivalent. Rather than grant everything, the importer narrows the key's model scope to the slugs and member models of the matching routes.
 - **Expired keys** (`expire_at` in the past) are skipped — Sepia rejects past expirations.
-- **Idempotency**: providers are reused when an existing provider has the same name *and* endpoint; routes are reused by slug; groups by id. Re-importing the same backup does not create duplicates. A same-name channel pointing at a *different* endpoint is treated as a distinct provider and gets a unique ` (n)` suffix.
+- **Idempotency**: providers are reused when an existing provider has the same name *and* first endpoint, or when only the first endpoint matches (so a renamed collision such as `Dup (2)` still matches by endpoint); routes are reused by slug and groups by id. Re-importing the same backup does not create duplicates. A unique ` (n)` suffix is only appended when the name collides with an existing provider *and* the endpoint differs.
 
 ## Build & package
 
