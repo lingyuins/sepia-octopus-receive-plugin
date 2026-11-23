@@ -1,38 +1,42 @@
+[English](README.en.md) | 简体中文
+
 # Octopus Receive
 
-A Sepia plugin that imports an [Octopus](https://github.com/bestruirui/octopus) backup JSON into this gateway through the management API. The sandboxed UI parses the backup and maps each entity into small management-API requests; the WASM guest forwards them through the `admin.request` host capability using the invoking administrator's session. Requires the `admin` permission and an administrator login.
+一个 Sepia 插件：通过管理 API 把 [Octopus](https://github.com/bestruirui/octopus) 备份 JSON 导入本网关。沙箱化的 UI 负责解析备份，并把每个实体映射为若干管理 API 请求；WASM guest 则使用调用方管理员的会话，通过 `admin.request` 宿主能力转发这些请求。需要 `admin` 权限，且需以管理员身份登录。
 
-## What is imported
+## 导入内容
 
-| Octopus | Sepia | Notes |
+| Octopus | Sepia | 说明 |
 | --- | --- | --- |
-| `channel_groups` | provider groups (`octopus-<id>`) | reused if present |
-| `channels` + `channel_keys` | providers + keys | type 0/5/6 → `openai`, 1 → `openai-responses`, 2 → `anthropic`, 3 → `gemini`; other types are skipped with a reason. Multiple `base_urls` become a unified channel; every address gets the full key set. |
-| `groups` + `group_items` | routes + candidates | candidates ordered by `priority`; mode 1→round-robin, 2→random, 4→weighted, 3/5→priority. Non-`chat` endpoint types are skipped. |
-| `llm_infos` | model pricing | $/M tokens → integer micros/token (minimum 1 when priced). |
-| `api_keys` | client keys + policies | preserves the plaintext secret, scope, limits and future expiry; IP whitelist, per-model quotas and excluded channels are applied via `/keys/{id}/policy`. |
+| `channel_groups` | 渠道商分组（`octopus-<id>`） | 已存在则复用 |
+| `channels` + `channel_keys` | 渠道商 + Key | type 0/5/6 → `openai`，1 → `openai-responses`，2 → `anthropic`，3 → `gemini`；其他类型会被跳过并给出原因。多个 `base_urls` 会合并为一个统一渠道商；每个地址都获得完整的 Key 集合。 |
+| `groups` + `group_items` | 路由 + 候选 | 候选按 `priority` 排序；模式 1→round-robin，2→random，4→weighted，3/5→priority。非 `chat` 端点类型会被跳过。 |
+| `llm_infos` | 模型价格 | $/M tokens → 整数 micros/token（有价格时最小为 1）。 |
+| `api_keys` | 客户端密钥 + 策略 | 保留明文 secret、scope、限额与未来的过期时间；IP 白名单、按模型配额与排除渠道通过 `/keys/{id}/policy` 应用。 |
 
-## Semantic differences (disclosed)
+## 语义差异（已披露）
 
-- **Routing mode 5 (auto)** has no Sepia equivalent (Sepia has no success-rate strategy); it maps to `priority` (saved order). Mode 3 (failover) also maps to `priority`.
-- **`match_regex`** is converted to Sepia glob patterns only for simple literal alternations / a trailing `.*`. Real regex metacharacters cannot be represented; the route keeps its slug pattern and the loss is logged.
-- **`allowed_group_categories`** restricts which Octopus *groups* (routes) a key can see. Sepia's `allowed_groups` filters *provider groups* instead, so the two are not equivalent. Rather than grant everything, the importer narrows the key's model scope to the slugs and member models of the matching routes.
-- **Expired keys** (`expire_at` in the past) are skipped — Sepia rejects past expirations.
-- **Idempotency**: providers are reused when an existing provider has the same name *and* endpoint; routes are reused by slug; groups by id. Re-importing the same backup does not create duplicates. A same-name channel pointing at a *different* endpoint is treated as a distinct provider and gets a unique ` (n)` suffix.
+- **路由模式 5（auto）** 在 Sepia 中没有对应实现（Sepia 没有成功率策略），因此映射为 `priority`（保存顺序）。模式 3（failover）同样映射为 `priority`。
+- **`match_regex`** 仅在简单的字面量并列（alternation）或末尾 `.*` 的情况下才转换为 Sepia 的 glob 模式；真正的正则元字符无法表示，此时路由保留其 slug 模式，并记录这一损失。
+- **`allowed_group_categories`** 限制某个 Key 能看到哪些 Octopus *分组*（即路由）。Sepia 的 `allowed_groups` 过滤的是*渠道商分组*，两者并不等价。为避免放开全部权限，导入器会把该 Key 的模型范围收窄到匹配路由的 slug 及其成员模型。
+- **已过期的 Key**（`expire_at` 早于当前时间）会被跳过——Sepia 拒绝过去的过期时间。
+- **幂等性**：当已存在的渠道商同名*且*端点相同时复用；路由按 slug 复用；分组按 id 复用。重复导入同一备份不会产生重复项。若同名渠道指向*不同*端点，则视为不同的渠道商，并附加唯一的 ` (n)` 后缀。
 
-## Build & package
+## 构建与打包
 
 ```sh
 cargo build --target wasm32-unknown-unknown --release
 node package.mjs   # writes octopus-receive.zip (manifest + plugin.wasm + ui/)
 ```
 
-Install the zip from Plugins → Install plugin, enable it, then Open UI. Choose a backup JSON, Analyze, review the counts and skipped items, then Import.
+`Cargo.toml` 通过相对路径 `../backend/plugin-sdk` 依赖 `sepia-plugin-sdk`，因此构建需要同级 Sepia 检出提供 `backend/plugin-sdk`。
 
-## Tests
+从 Plugins → Install plugin 安装 zip，启用后点击 Open UI。选择备份 JSON，点击 Analyze，核对计数与被跳过项，然后执行 Import。
+
+## 测试
 
 ```sh
 node --test mapping.test.mjs
 ```
 
-Pure mapping logic is covered by `mapping.test.mjs` (protocol mapping, name uniqueness, id-based candidates, multi-address keys, idempotent reuse, regex conversion, key policies/expiry/categories).
+纯映射逻辑由 `mapping.test.mjs` 覆盖（协议映射、名称唯一性、基于 id 的候选、多地址 Key、幂等复用、正则转换、Key 策略/过期/分组类别）。
