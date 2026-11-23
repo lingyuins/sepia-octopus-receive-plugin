@@ -29,7 +29,12 @@ cargo build --target wasm32-unknown-unknown --release
 node package.mjs   # writes octopus-receive.zip (manifest + plugin.wasm + ui/)
 ```
 
-`Cargo.toml` depends on `sepia-plugin-sdk` by the relative path `../backend/plugin-sdk`, so building requires a sibling Sepia checkout that provides `backend/plugin-sdk`.
+`Cargo.toml` pulls `sepia-plugin-sdk` from the Sepia repository over git, pinned to rev `e912ca66f0` (which includes the bump allocator `ensure_capacity` fix), so a standalone clone builds without a sibling Sepia checkout. When developing inside a Sepia checkout, create a gitignored `.cargo/config.toml` to use the local path instead, so the build picks up the SDK from your working tree:
+
+```toml
+[patch."https://github.com/lingyuins/Sepia"]
+sepia-plugin-sdk = { path = "../backend/plugin-sdk" }
+```
 
 Install the zip from Plugins → Install plugin, enable it, then Open UI. Choose a backup JSON, Analyze, review the counts and skipped items, then Import.
 

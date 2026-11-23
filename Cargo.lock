@@ -12,3 +12,4 @@ dependencies = [
 [[package]]
 name = "sepia-plugin-sdk"
 version = "0.1.0"
+source = "git+https://github.com/lingyuins/Sepia?rev=e912ca66f022978c1fecf3fac721bb291efc7a0b#e912ca66f022978c1fecf3fac721bb291efc7a0b"

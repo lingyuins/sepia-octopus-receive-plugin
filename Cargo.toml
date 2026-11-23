@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-sepia-plugin-sdk = { path = "../backend/plugin-sdk" }
+sepia-plugin-sdk = { git = "https://github.com/lingyuins/Sepia", rev = "e912ca66f022978c1fecf3fac721bb291efc7a0b" }
 
 [lib]
 crate-type = ["cdylib"]

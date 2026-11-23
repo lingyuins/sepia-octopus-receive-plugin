@@ -29,7 +29,12 @@ cargo build --target wasm32-unknown-unknown --release
 node package.mjs   # writes octopus-receive.zip (manifest + plugin.wasm + ui/)
 ```
 
-`Cargo.toml` 通过相对路径 `../backend/plugin-sdk` 依赖 `sepia-plugin-sdk`，因此构建需要同级 Sepia 检出提供 `backend/plugin-sdk`。
+`Cargo.toml` 通过 git 依赖固定 Sepia 仓库中的 `sepia-plugin-sdk`（rev `e912ca66f0`，含 bump allocator 的 `ensure_capacity` 修复），因此独立克隆可直接构建，无需同级 Sepia 检出。若你正在 Sepia 检出内开发，可创建不入库的 `.cargo/config.toml` 覆盖为本地路径，构建会使用工作区里的 SDK：
+
+```toml
+[patch."https://github.com/lingyuins/Sepia"]
+sepia-plugin-sdk = { path = "../backend/plugin-sdk" }
+```
 
 从 Plugins → Install plugin 安装 zip，启用后点击 Open UI。选择备份 JSON，点击 Analyze，核对计数与被跳过项，然后执行 Import。
 
