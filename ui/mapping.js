@@ -103,9 +103,201 @@ function regexToGlobs(regex) {
   return globs
 }
 
+// ---------------------------------------------------------------------------
+// Request rewriting: Octopus channel fields → Sepia provider/route rewrite
+// arrays (headers, param_replace, prompt_replace, param_defaults).
+// ---------------------------------------------------------------------------
+
+// Headers Sepia refuses to store because they carry auth or framing. Mirrored
+// here so an import discloses the loss instead of failing at the gateway.
+const REWRITE_RESERVED_HEADERS = [
+  'authorization', 'proxy-authorization', 'cookie', 'set-cookie', 'host',
+  'x-api-key', 'x-goog-api-key', 'anthropic-version', 'content-length',
+  'transfer-encoding', 'connection', 'keep-alive',
+]
+
+// Octopus codex header profile (internal/transformer/rewrite/config.go:58-63).
+const CODEX_HEADERS = [
+  { name: 'User-Agent', value: 'Codex Desktop/0.131.0 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 26.519.21041)' },
+  { name: 'Origin', value: 'https://chat.openai.com' },
+  { name: 'Referer', value: 'https://chat.openai.com/' },
+  { name: 'Accept', value: 'application/json' },
+]
+
+// Octopus param_override honors exactly these fields
+// (internal/relay/rewrite.go:70-93), all only-if-absent like Sepia defaults.
+const PARAM_DEFAULT_FIELDS = [
+  ['max_tokens', 'int'],
+  ['max_completion_tokens', 'int'],
+  ['temperature', 'number'],
+  ['top_p', 'number'],
+]
+
+// Keep only the last rule per key, preserving that last rule's position.
+function dedupeByKey(rules, keyOf) {
+  const lastIndex = new Map()
+  rules.forEach((rule, index) => lastIndex.set(keyOf(rule), index))
+  return rules.filter((rule, index) => lastIndex.get(keyOf(rule)) === index)
+}
+
+function mapCustomHeaders(list, skipped, providerName) {
+  const rules = []
+  for (const entry of Array.isArray(list) ? list : []) {
+    const name = String((entry && (entry.header_key != null ? entry.header_key : entry.name)) || '').trim()
+    const value = entry ? String(entry.header_value != null ? entry.header_value : (entry.value != null ? entry.value : '')) : ''
+    if (!name) { skipped.push({ kind: 'rewrite', name: providerName, reason: 'custom_header with an empty name' }); continue }
+    if (REWRITE_RESERVED_HEADERS.indexOf(name.toLowerCase()) >= 0) {
+      skipped.push({ kind: 'rewrite', name: providerName, reason: `custom_header ${name} is a reserved header and cannot be migrated` })
+      continue
+    }
+    rules.push({ name, value })
+  }
+  return dedupeByKey(rules, (rule) => rule.name.toLowerCase())
+}
+
+// Sepia only knows 4 scalar defaults; everything else in the Octopus JSON is
+// disclosed rather than silently dropped.
+function mapParamDefaults(override, skipped, providerName) {
+  if (override == null || override === '') return []
+  let parsed = override
+  if (typeof override === 'string') {
+    try { parsed = JSON.parse(override) } catch (error) {
+      skipped.push({ kind: 'rewrite', name: providerName, reason: 'param_override is not valid JSON' })
+      return []
+    }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    skipped.push({ kind: 'rewrite', name: providerName, reason: 'param_override is not a JSON object' })
+    return []
+  }
+  const rules = []
+  for (const [field, kind] of PARAM_DEFAULT_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(parsed, field)) continue
+    const value = parsed[field]
+    const valid = kind === 'int'
+      ? typeof value === 'number' && Number.isInteger(value)
+      : typeof value === 'number' && Number.isFinite(value)
+    if (!valid) {
+      skipped.push({ kind: 'rewrite', name: providerName, reason: `param_override ${field} must be a ${kind === 'int' ? 'whole number' : 'number'}` })
+      continue
+    }
+    rules.push({ field, value })
+  }
+  for (const field of Object.keys(parsed)) {
+    if (PARAM_DEFAULT_FIELDS.some((entry) => entry[0] === field)) continue
+    skipped.push({ kind: 'rewrite', name: providerName, reason: `param_override ${field} has no Sepia equivalent (only max_tokens, max_completion_tokens, temperature, top_p)` })
+  }
+  return rules
+}
+
+// Rust's regex crate has no lookaround, backreferences, atomic groups or
+// conditionals; such patterns must not be imported (the gateway rejects them).
+function rustRegexCompatible(pattern) {
+  const source = String(pattern == null ? '' : pattern)
+  if (!source) return false
+  return !/\(\?<?[=!]|\(\?>|\(\?\(|\\[1-9]|\\k</.test(source)
+}
+
+// ECMAScript named groups use $<name>; Rust replacement syntax is ${name}.
+function rustReplacement(replacement) {
+  return String(replacement == null ? '' : replacement).replace(/\$<([A-Za-z_][A-Za-z0-9_]*)>/g, '${$1}')
+}
+
+function mapPromptRules(list, skipped, providerName) {
+  const rules = []
+  for (const entry of Array.isArray(list) ? list : []) {
+    const pattern = String((entry && entry.pattern != null) ? entry.pattern : '')
+    if (!pattern) { skipped.push({ kind: 'rewrite', name: providerName, reason: 'prompt rule with an empty pattern' }); continue }
+    if (!rustRegexCompatible(pattern)) {
+      skipped.push({ kind: 'rewrite', name: providerName, reason: `prompt rule ${pattern} uses regex features Sepia cannot compile (lookaround/backreference/atomic group)` })
+      continue
+    }
+    rules.push({ pattern, replacement: rustReplacement(entry.replacement) })
+  }
+  return dedupeByKey(rules, (rule) => rule.pattern)
+}
+
+// Map one Octopus channel's rewriting configuration. `custom_header` and
+// `param_override` apply regardless of request_rewrite.enabled; profile,
+// prompt rules and the strategy flags only when enabled (Octopus semantics).
+// Unsupported capabilities are disclosed, never reported as migrated.
+function mapRewrite(channel, providerName) {
+  const skipped = []
+  let headers = mapCustomHeaders(channel.custom_header, skipped, providerName)
+  const paramDefaults = mapParamDefaults(channel.param_override, skipped, providerName)
+  let promptReplace = []
+  const config = channel.request_rewrite
+  if (config && config.enabled === true) {
+    if (config.header_profile === 'codex') headers = dedupeByKey([...CODEX_HEADERS, ...headers], (rule) => rule.name.toLowerCase())
+    promptReplace = mapPromptRules(config.prompt_rules, skipped, providerName)
+    if (config.profile === 'openai_chat_compat') {
+      skipped.push({ kind: 'rewrite', name: providerName, reason: 'request_rewrite profile openai_chat_compat not migrated (message shaping has no Sepia equivalent)' })
+    } else if (config.profile === 'codex') {
+      skipped.push({ kind: 'rewrite', name: providerName, reason: 'request_rewrite profile codex: only the fixed headers are migrated, message shaping is not' })
+    }
+    if (config.tool_role_strategy && config.tool_role_strategy !== 'keep') {
+      skipped.push({ kind: 'rewrite', name: providerName, reason: `tool_role_strategy ${config.tool_role_strategy} not migrated` })
+    }
+    if (config.system_message_strategy && config.system_message_strategy !== 'keep') {
+      skipped.push({ kind: 'rewrite', name: providerName, reason: `system_message_strategy ${config.system_message_strategy} not migrated` })
+    }
+  }
+  const fields = { headers, param_replace: [], prompt_replace: promptReplace, param_defaults: paramDefaults }
+  return { fields, skipped, count: headers.length + promptReplace.length + paramDefaults.length }
+}
+
+// Canonical form used to decide whether a reused provider already carries the
+// migrated rules (re-imports stay idempotent and issue no request).
+function canonicalRewrite(source) {
+  const value = source || {}
+  const list = (entries) => (Array.isArray(entries) ? entries : [])
+  const headers = list(value.headers)
+    .map((rule) => [String(rule.name || '').toLowerCase(), String(rule.value == null ? '' : rule.value)])
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+  const paramReplace = list(value.param_replace)
+    .map((rule) => [String(rule.field || ''), String(rule.pattern || ''), String(rule.replacement || '')])
+    .sort((a, b) => (a[0] + '\u0000' + a[1] < b[0] + '\u0000' + b[1] ? -1 : 1))
+  const promptReplace = list(value.prompt_replace)
+    .map((rule) => [String(rule.pattern || ''), String(rule.replacement || '')])
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+  const paramDefaults = list(value.param_defaults)
+    .map((rule) => [String(rule.field || ''), JSON.stringify(rule.value)])
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+  return JSON.stringify({ headers, param_replace: paramReplace, prompt_replace: promptReplace, param_defaults: paramDefaults })
+}
+
+// PUT body for a provider that already exists: re-send its current identity
+// (name/protocol/endpoint/models/group/enabled/mode, unified addresses) with
+// empty secrets so stored keys are untouched, plus the migrated rewrite arrays.
+function providerUpdateBody(provider, fields) {
+  const body = {
+    name: provider.name,
+    protocol: provider.protocol,
+    endpoint: provider.endpoint,
+    models: provider.models,
+    group_id: provider.group_id || 'official',
+    enabled: provider.enabled !== false,
+    mode: provider.mode || 'single',
+    plugin_id: provider.plugin_id == null ? null : provider.plugin_id,
+    secret: '',
+    secrets: [],
+    headers: fields.headers,
+    param_replace: fields.param_replace,
+    prompt_replace: fields.prompt_replace,
+    param_defaults: fields.param_defaults,
+  }
+  if (body.mode === 'unified') {
+    body.endpoints = (Array.isArray(provider.endpoints) ? provider.endpoints : [])
+      .map((entry) => ({ endpoint: entry.endpoint, secrets: [] }))
+  }
+  return body
+}
+
 // channels + channel_keys + channel_groups → group/provider create requests.
 // Existing providers (by name) and groups (by id) are reused, making re-imports
-// idempotent. providerMap maps Octopus channel id → the Sepia provider name.
+// idempotent; a reused provider additionally gets a PUT when the channel's
+// rewrite rules differ from what is stored. providerMap maps Octopus channel
+// id → the Sepia provider name.
 function mapProviders(backup, existingProviders, existingGroups) {
   const requests = []
   const skipped = []
@@ -116,6 +308,8 @@ function mapProviders(backup, existingProviders, existingGroups) {
   const existingByEndpoint = new Map((existingProviders || []).map((provider) => [provider.endpoint, provider]))
   const usedNames = new Set((existingProviders || []).map((provider) => provider.name))
   const knownGroups = new Set((existingGroups || []).map((group) => group.id))
+  let rewriteRules = 0
+  let rewriteUpdates = 0
 
   for (const group of backup.channel_groups || []) {
     const id = `octopus-${group.id}`
@@ -133,8 +327,28 @@ function mapProviders(backup, existingProviders, existingGroups) {
     const protocol = protocolFor(channel.type)
     if (protocol === null) { skipped.push({ kind: 'provider', name: rawName, reason: `unsupported channel type ${channel.type}` }); continue }
     if (urls.length === 0 || keys.length === 0 || models.length === 0) { skipped.push({ kind: 'provider', name: rawName, reason: 'missing endpoint, key or model' }); continue }
+    const rewrite = mapRewrite(channel, rawName)
+    skipped.push(...rewrite.skipped)
+    rewriteRules += rewrite.count
     const reuse = existingByKey.get(`${rawName}\u0000${urls[0]}`) || existingByEndpoint.get(urls[0])
-    if (reuse) { providerMap.set(channel.id, reuse.name); continue }
+    if (reuse) {
+      providerMap.set(channel.id, reuse.name)
+      if (rewrite.count === 0) continue
+      // A reused provider still needs the channel's rewriting migrated. Re-send
+      // its identity with empty secrets (keys untouched); skip the request when
+      // the stored rules already match, keeping re-imports idempotent.
+      if (reuse.id == null || !reuse.protocol || !reuse.endpoint || !Array.isArray(reuse.models)) {
+        skipped.push({ kind: 'rewrite', name: reuse.name, reason: 'existing provider is missing protocol/models; rewrite rules not updated' })
+        continue
+      }
+      if (canonicalRewrite(reuse) === canonicalRewrite(rewrite.fields)) continue
+      rewriteUpdates += 1
+      requests.push({
+        path: `/api/v1/providers/${reuse.id}`, method: 'PUT', kind: 'provider-update', name: reuse.name,
+        body: providerUpdateBody(reuse, rewrite.fields),
+      })
+      continue
+    }
     const name = uniqueName(rawName, usedNames)
     providerMap.set(channel.id, name)
     const groupId = channel.group_id != null ? `octopus-${channel.group_id}` : 'official'
@@ -143,7 +357,7 @@ function mapProviders(backup, existingProviders, existingGroups) {
     if (urls.length === 1) {
       requests.push({
         path: '/api/v1/providers', method: 'POST', kind: 'provider', name,
-        body: { name, protocol, endpoint: urls[0], models, secret: secrets[0], secrets, group_id: groupId, enabled, mode: 'single' },
+        body: { name, protocol, endpoint: urls[0], models, secret: secrets[0], secrets, group_id: groupId, enabled, mode: 'single', ...rewrite.fields },
       })
     } else {
       requests.push({
@@ -153,11 +367,15 @@ function mapProviders(backup, existingProviders, existingGroups) {
           // Every address gets the full key set (Octopus keys are channel-level).
           // Top-level secret/secrets mirror the first address (backend requires them).
           endpoints: urls.map((url) => ({ endpoint: url, secrets })),
+          ...rewrite.fields,
         },
       })
     }
   }
-  return { requests, providerMap, skipped }
+  return {
+    requests, providerMap, skipped,
+    rewrite: { rules: rewriteRules, updates: rewriteUpdates, skipped: skipped.filter((item) => item.kind === 'rewrite').length },
+  }
 }
 
 // groups + group_items → route create requests. providerMap holds provider ids
@@ -321,6 +539,7 @@ function buildPlan(backup, existing) {
     providerMap: providers.providerMap,
     policies: keys.policies,
     skipped: [...providers.skipped, ...keys.skipped],
+    rewrite: providers.rewrite,
     phases: [
       { id: 'providers', requests: providers.requests },
       { id: 'routes', requests: [], source: 'routes' },
@@ -343,6 +562,11 @@ function resolvePhases(plan, backup, providerIds, existingRoutes) {
   return { routes, prices, policies }
 }
 
-  return { slugify, uniqueSlug, uniqueName, protocolFor, splitModels, priceMicros, strategyFor, regexToGlobs, mapProviders, mapRoutes, mapPrices, mapKeys, categoryModels, buildPlan, resolvePhases }
+  return {
+    slugify, uniqueSlug, uniqueName, protocolFor, splitModels, priceMicros, strategyFor, regexToGlobs,
+    REWRITE_RESERVED_HEADERS, CODEX_HEADERS, rustRegexCompatible, mapCustomHeaders, mapParamDefaults,
+    mapPromptRules, mapRewrite, canonicalRewrite, providerUpdateBody,
+    mapProviders, mapRoutes, mapPrices, mapKeys, categoryModels, buildPlan, resolvePhases,
+  }
 })()
 if (typeof window !== 'undefined') window.OctopusMapping = OctopusMapping

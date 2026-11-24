@@ -13,6 +13,7 @@ A Sepia plugin that imports an [Octopus](https://github.com/bestruirui/octopus) 
 | `groups` + `group_items` | routes + candidates | candidates ordered by `priority`; mode 1→round-robin, 2→random, 4→weighted, 3/5→priority. Non-`chat` endpoint types are skipped. |
 | `llm_infos` | model pricing | $/M tokens → integer micros/token (minimum 1 when priced). |
 | `api_keys` | client keys + policies | preserves the plaintext secret, scope, limits and future expiry; IP whitelist, per-model quotas and excluded channels are applied via `/keys/{id}/policy`. |
+| `custom_header` / `param_override` / `request_rewrite` | provider request rewriting (`headers` / `param_defaults` / `prompt_replace`) | `custom_header` → static outbound `headers`; `param_override` migrates only the four defaults `max_tokens`, `max_completion_tokens`, `temperature`, `top_p` (applied only when the request omits them); `request_rewrite.header_profile = codex` expands to the 4 fixed headers; `prompt_rules` → `prompt_replace`, which only touches system/developer prompts. |
 
 ## Semantic differences (disclosed)
 
@@ -20,7 +21,9 @@ A Sepia plugin that imports an [Octopus](https://github.com/bestruirui/octopus) 
 - **`match_regex`** is converted to Sepia glob patterns only for simple literal alternations / a trailing `.*`. Real regex metacharacters cannot be represented; the route keeps its slug pattern and the loss is logged.
 - **`allowed_group_categories`** restricts which Octopus *groups* (routes) a key can see. Sepia's `allowed_groups` filters *provider groups* instead, so the two are not equivalent. Rather than grant everything, the importer narrows the key's model scope to the slugs and member models of the matching routes.
 - **Expired keys** (`expire_at` in the past) are skipped — Sepia rejects past expirations.
-- **Idempotency**: providers are reused when an existing provider has the same name *and* first endpoint, or when only the first endpoint matches (so a renamed collision such as `Dup (2)` still matches by endpoint); routes are reused by slug and groups by id. Re-importing the same backup does not create duplicates. A unique ` (n)` suffix is only appended when the name collides with an existing provider *and* the endpoint differs.
+- **Unsupported rewriting is skipped item by item and disclosed**: the `profile` message shaping (all of `openai_chat_compat`, everything except the fixed headers for `codex`), `tool_role_strategy = stringify_to_user`, `system_message_strategy = merge`, `prompt_rules` the Rust regex engine cannot compile (lookaround, backreferences, atomic groups, conditionals), reserved/sensitive headers (authorization, cookie, host, content-length, …) and `param_override` keys outside the four supported fields. Skipped rewriting is never reported as migrated.
+- **`prompt_rules` replacements**: ECMAScript named-group references `$<name>` become Rust `${name}`. Sepia uses the Rust regex engine, which has no lookaround or backreferences, so such rules are skipped during Analyze.
+- **Idempotency**: providers are reused when an existing provider has the same name *and* first endpoint, or when only the first endpoint matches (so a renamed collision such as `Dup (2)` still matches by endpoint); a reused provider with rewriting is updated in place with `PUT /providers/{id}`, writing the four rewriting arrays without sending secrets or clearing existing keys, and no request is sent when the stored rules already match. Routes are reused by slug and groups by id. Re-importing the same backup does not create duplicates. A unique ` (n)` suffix is only appended when the name collides with an existing provider *and* the endpoint differs.
 
 ## Build & package
 
@@ -43,4 +46,4 @@ Install the zip from Plugins → Install plugin, enable it, then Open UI. Choose
 node --test mapping.test.mjs
 ```
 
-Pure mapping logic is covered by `mapping.test.mjs` (protocol mapping, name uniqueness, id-based candidates, multi-address keys, idempotent reuse, regex conversion, key policies/expiry/categories).
+Pure mapping logic is covered by `mapping.test.mjs` (protocol mapping, name uniqueness, id-based candidates, multi-address keys, idempotent reuse, regex conversion, key policies/expiry/categories, request rewriting and its skip disclosure).

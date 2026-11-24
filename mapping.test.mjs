@@ -42,6 +42,30 @@ const backup = {
 // channel id → provider id used to resolve route/price phases.
 const providerIds = new Map([[8, 1], [9, 2]])
 
+// One channel with a custom header, the codex header profile and a prompt rule.
+const rewriteBackup = {
+  channels: [{
+    id: 1,
+    name: 'Codex',
+    type: 1,
+    base_urls: [{ url: 'https://c/v1' }],
+    model: 'gpt-5',
+    custom_header: [
+      { header_key: 'X-Trace-Id', header_value: 'abc' },
+      { header_key: 'Authorization', header_value: 'Bearer leak' },
+      { header_key: 'x-trace-id', header_value: 'last-wins' },
+    ],
+    param_override: JSON.stringify({ max_tokens: 512, top_p: 0.2 }),
+    request_rewrite: {
+      enabled: true,
+      profile: 'codex',
+      header_profile: 'codex',
+      prompt_rules: [{ pattern: '^You are Claude', replacement: 'You are GPT' }],
+    },
+  }],
+  channel_keys: [{ channel_id: 1, channel_key: 'sk-c', enabled: true }],
+}
+
 test('slugify, uniqueSlug and uniqueName', () => {
   assert.equal(M.slugify('Chat Group'), 'chat-group')
   assert.equal(M.slugify('额度/渠道监控'), 'imported')
@@ -255,4 +279,145 @@ test('mapKeys skips keys whose name already exists (idempotent re-import)', () =
   assert.equal(requests.length, 1) // only "All" remains
   assert.equal(requests[0].name, 'All')
   assert.ok(skipped.some((item) => item.name === 'Phone' && /already exists/.test(item.reason)))
+})
+test('mapProviders migrates custom_header and the codex header profile', () => {
+  const { requests, skipped } = M.mapProviders(rewriteBackup, [], [])
+  const body = requests.find((request) => request.kind === 'provider').body
+  assert.deepEqual(body.headers, [
+    { name: 'User-Agent', value: 'Codex Desktop/0.131.0 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 26.519.21041)' },
+    { name: 'Origin', value: 'https://chat.openai.com' },
+    { name: 'Referer', value: 'https://chat.openai.com/' },
+    { name: 'Accept', value: 'application/json' },
+    { name: 'x-trace-id', value: 'last-wins' },
+  ])
+  assert.deepEqual(body.param_replace, [])
+  assert.ok(skipped.some((item) => item.kind === 'rewrite' && /Authorization/.test(item.reason)))
+  assert.ok(skipped.some((item) => /profile codex/.test(item.reason)))
+})
+
+test('mapProviders maps param_override to only-if-absent defaults and skips the rest', () => {
+  const withParams = {
+    channels: [{
+      id: 1, name: 'P', type: 0, base_urls: [{ url: 'https://p/v1' }], model: 'm',
+      param_override: JSON.stringify({ max_tokens: 512, temperature: 0.2, top_p: 'high', frequency_penalty: 0.5, max_completion_tokens: 64 }),
+    }],
+    channel_keys: [{ channel_id: 1, channel_key: 'k', enabled: true }],
+  }
+  const { requests, skipped } = M.mapProviders(withParams, [], [])
+  const body = requests.find((request) => request.kind === 'provider').body
+  assert.deepEqual(body.param_defaults, [
+    { field: 'max_tokens', value: 512 },
+    { field: 'max_completion_tokens', value: 64 },
+    { field: 'temperature', value: 0.2 },
+  ])
+  assert.ok(skipped.some((item) => /top_p must be a number/.test(item.reason)))
+  assert.ok(skipped.some((item) => /frequency_penalty has no Sepia equivalent/.test(item.reason)))
+  const broken = M.mapProviders({
+    channels: [{ id: 2, name: 'B', type: 0, base_urls: [{ url: 'https://b/v1' }], model: 'm', param_override: '{oops' }],
+    channel_keys: [{ channel_id: 2, channel_key: 'k', enabled: true }],
+  }, [], [])
+  assert.ok(broken.skipped.some((item) => /not valid JSON/.test(item.reason)))
+  assert.deepEqual(broken.requests.find((request) => request.kind === 'provider').body.param_defaults, [])
+})
+
+test('mapProviders maps prompt rules to system-only replacements and skips Rust-incompatible patterns', () => {
+  const withPrompts = {
+    channels: [{
+      id: 1, name: 'Pr', type: 0, base_urls: [{ url: 'https://pr/v1' }], model: 'm',
+      request_rewrite: {
+        enabled: true,
+        profile: 'preserve',
+        prompt_rules: [
+          { pattern: '^You are Claude', replacement: 'You are GPT' },
+          { pattern: '(?<=role:)assistant', replacement: 'model' },
+          { pattern: '(\\w+)-\\1', replacement: 'dup' },
+          { pattern: '(?P<name>Codex)', replacement: 'Agent $<name>' },
+        ],
+      },
+    }],
+    channel_keys: [{ channel_id: 1, channel_key: 'k', enabled: true }],
+  }
+  const { requests, skipped } = M.mapProviders(withPrompts, [], [])
+  const body = requests.find((request) => request.kind === 'provider').body
+  assert.deepEqual(body.prompt_replace, [
+    { pattern: '^You are Claude', replacement: 'You are GPT' },
+    { pattern: '(?P<name>Codex)', replacement: 'Agent ${name}' },
+  ])
+  assert.equal(skipped.filter((item) => /prompt rule/.test(item.reason)).length, 2)
+  assert.equal(M.rustRegexCompatible('a(?=b)'), false)
+  assert.equal(M.rustRegexCompatible('(\\w)\\1'), false)
+  assert.equal(M.rustRegexCompatible('^\\s*(You|I) are'), true)
+})
+
+test('mapProviders updates a reused provider with rewrite rules without clearing keys', () => {
+  const stored = {
+    id: 77, name: 'Codex', protocol: 'openai-responses', endpoint: 'https://c/v1',
+    models: ['gpt-5'], group_id: 'octopus-3', enabled: true, mode: 'single',
+    headers: [], param_replace: [], prompt_replace: [], param_defaults: [],
+  }
+  const first = M.mapProviders(rewriteBackup, [stored], [])
+  assert.equal(first.requests.filter((request) => request.kind === 'provider').length, 0)
+  const update = first.requests.find((request) => request.kind === 'provider-update')
+  assert.equal(update.method, 'PUT')
+  assert.equal(update.path, '/api/v1/providers/77')
+  assert.equal(update.body.name, 'Codex')
+  assert.equal(update.body.mode, 'single')
+  assert.equal(update.body.secret, '')
+  assert.deepEqual(update.body.secrets, [])
+  assert.deepEqual(update.body.models, ['gpt-5'])
+  assert.ok(update.body.headers.some((header) => header.name === 'User-Agent'))
+  assert.equal(first.rewrite.updates, 1)
+  // Idempotent: the stored provider already carries these rules, so no request.
+  const upToDate = {
+    ...stored,
+    headers: update.body.headers,
+    param_replace: update.body.param_replace,
+    prompt_replace: update.body.prompt_replace,
+    param_defaults: update.body.param_defaults,
+  }
+  const second = M.mapProviders(rewriteBackup, [upToDate], [])
+  assert.equal(second.requests.filter((request) => request.kind === 'provider-update').length, 0)
+  assert.equal(second.rewrite.updates, 0)
+})
+
+test('mapProviders discloses a reused provider that cannot be updated', () => {
+  const bare = { id: 77, name: 'Codex', endpoint: 'https://c/v1' }
+  const { requests, skipped } = M.mapProviders(rewriteBackup, [bare], [])
+  assert.equal(requests.filter((request) => request.kind === 'provider-update').length, 0)
+  assert.ok(skipped.some((item) => /missing protocol\/models/.test(item.reason)))
+})
+
+test('mapProviders discloses unsupported rewrite capabilities', () => {
+  const channel = {
+    id: 4, name: 'Cfg', type: 0, base_urls: [{ url: 'https://cfg/v1' }], model: 'm',
+    request_rewrite: {
+      enabled: true,
+      profile: 'openai_chat_compat',
+      header_profile: 'codex',
+      tool_role_strategy: 'stringify_to_user',
+      system_message_strategy: 'merge',
+    },
+  }
+  const { requests, skipped } = M.mapProviders({
+    channels: [channel],
+    channel_keys: [{ channel_id: 4, channel_key: 'k', enabled: true }],
+  }, [], [])
+  const reasons = skipped.map((item) => item.reason).join(' | ')
+  assert.match(reasons, /openai_chat_compat/)
+  assert.match(reasons, /tool_role_strategy stringify_to_user/)
+  assert.match(reasons, /system_message_strategy merge/)
+  // Headers still migrate; nothing else is claimed.
+  const body = requests.find((request) => request.kind === 'provider').body
+  assert.equal(body.headers.length, 4)
+  assert.deepEqual(body.prompt_replace, [])
+})
+
+test('buildPlan exposes rewrite counts for the analyze preview', () => {
+  const plan = M.buildPlan(rewriteBackup, { providers: [], routes: [], groups: [], keys: [] })
+  // 4 codex headers + 1 custom header + 1 prompt rule + 2 param defaults
+  assert.equal(plan.rewrite.rules, 8)
+  assert.equal(plan.rewrite.updates, 0)
+  assert.equal(plan.rewrite.skipped, 2) // Authorization + codex profile disclosure
+  const plain = M.buildPlan(backup, { providers: [], routes: [], groups: [], keys: [] })
+  assert.deepEqual(plain.rewrite, { rules: 0, updates: 0, skipped: 0 })
 })

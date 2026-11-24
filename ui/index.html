@@ -129,12 +129,26 @@
   })
 
   function renderPreview() {
-    var labels = { providers: 'Providers', routes: 'Routes', prices: 'Prices', keys: 'API keys' }
+    var labels = {
+      providers: 'Providers',
+      rewrite: 'Rewrite rules',
+      rewriteUpdates: 'Rewrite updates',
+      routes: 'Routes',
+      prices: 'Prices',
+      keys: 'API keys',
+    }
     var countsEl = document.getElementById('counts')
     countsEl.textContent = ''
     // Provider/key counts are known up front; routes/prices resolve after the
-    // provider phase, so show a dash until then.
-    var known = { providers: plan.phases[0].requests.length, keys: plan.phases[3].requests.length }
+    // provider phase, so show a dash until then. Rewrite rules are counted
+    // while mapping providers (headers, param defaults and prompt rules).
+    var summary = plan.rewrite || { rules: 0, updates: 0, skipped: 0 }
+    var known = {
+      providers: plan.phases[0].requests.length - summary.updates,
+      rewrite: summary.rules,
+      rewriteUpdates: summary.updates,
+      keys: plan.phases[3].requests.length,
+    }
     Object.keys(labels).forEach(function (id) {
       var cell = document.createElement('div')
       cell.className = 'count'
@@ -148,6 +162,9 @@
     ;(plan.skipped || []).forEach(function (item) {
       logLine('skip ' + item.kind + ' ' + item.name + ': ' + item.reason, 'err')
     })
+    if (summary.rules > 0 || summary.skipped > 0) {
+      logLine('Rewrite: ' + summary.rules + ' rule(s) will be migrated' + (summary.updates ? ' (' + summary.updates + ' existing provider(s) updated)' : '') + ', ' + summary.skipped + ' item(s) skipped — skipped rewriting is never reported as migrated.', summary.skipped ? 'err' : 'ok')
+    }
   }
 
   resetBtn.addEventListener('click', function () {
